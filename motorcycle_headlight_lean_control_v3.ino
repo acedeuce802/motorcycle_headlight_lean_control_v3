@@ -11,36 +11,28 @@
  * - NEMA 8 stepper motor driving worm gear (72:1) -> bi-LED projector rotation
  * - 2x limit switches (D6/D7, active LOW with pull-ups)
  *
- * Homing sequence on startup:
- *   1. Rotate toward left limit switch until triggered -> record as step 0
- *   2. Rotate toward right limit switch until triggered -> record as maxSteps
- *   3. Move to center (maxSteps / 2) -> this is the straight-ahead position
+ * Homing sequence (triggered manually via web UI button):
+ *   1. Rotate toward left limit switch until triggered -> record pot ADC
+ *   2. Rotate toward right limit switch until triggered -> record pot ADC
+ *   3. Move to center (midpoint) -> set center ADC, enable closed loop, save to NVS
+ *   On subsequent boots: pot calibration loaded from NVS, homing skipped
  *
- * Lean angle sources:
- *   - Distance sensors: geometry-based, requires valid readings from both sensors
- *   - BMI160 gyro: integration of yaw rate * speed (Reidel model), requires speed > 2m/s
- *   - Fusion: weighted blend when both available
- *
- * Web Server (AP mode, IP: 192.168.5.1):
- *   / (Dashboard): live lean angle, projector position, sensor diagnostics
- *   /calibrate:    lean-to-angle mapping, sensor geometry
- *   /config:       WiFi, device name
- *   /update:       OTA firmware upload
- *   /test:         manual projector position control, stepper diagnostic
- *
- * Sensor geometry config (per sensor):
- *   - Height above ground (mm)
- *   - Width from centerline (mm)
- *   - Mount angle offset (degrees)
+ * Position control:
+ *   Closed loop (default after first homing): pot ADC drives step direction
+ *   Open loop (fallback): step counter used if pot not calibrated
  *
  * Pin Assignments (ESP32-C6 Xiao):
- *   D0 (GPIO1):  STEP -> TMC2209
- *   D1 (GPIO2):  DIR  -> TMC2209
- *   D2 (GPIO3):  EN   -> TMC2209 (active LOW)
- *   D4 (GPIO22): I2C SDA -> TCA9548A, BMI160
- *   D5 (GPIO23): I2C SCL -> TCA9548A, BMI160
- *   D6 (GPIO16): Limit switch LEFT  (INPUT_PULLUP, active LOW)
- *   D7 (GPIO17): Limit switch RIGHT (INPUT_PULLUP, active LOW)
+ *   D0  (GPIO0):  STEP -> TMC2209
+ *   D1  (GPIO1):  DIR  -> TMC2209
+ *   D2  (GPIO2):  EN   -> TMC2209 (active LOW)
+ *   D3  (GPIO21): TMC2209 UART TX (via 1kΩ) + RX (D9) for current control
+ *   D4  (GPIO22): I2C SDA -> TCA9548A, BMI160
+ *   D5  (GPIO23): I2C SCL -> TCA9548A, BMI160
+ *   D6  (GPIO16): Limit switch LEFT  (INPUT_PULLUP, active LOW)
+ *   D7  (GPIO17): Limit switch RIGHT (INPUT_PULLUP, active LOW)
+ *   D8  (GPIO19): Speed sensor input
+ *   D9  (GPIO20): TMC2209 UART RX
+ *   D10 (GPIO18): Position pot ADC input
  */
 
 #include <Wire.h>
@@ -55,19 +47,23 @@
 // ============================================================================
 // FIRMWARE VERSION
 // ============================================================================
-#define FIRMWARE_VERSION "20260322_01"
+#define FIRMWARE_VERSION "20260413_01"
 
 
 // ============================================================================
 // PIN DEFINITIONS
 // ============================================================================
-#define STEP_PIN            1     // D0 - TMC2209 STEP
-#define DIR_PIN             2     // D1 - TMC2209 DIR
-#define EN_PIN              3     // D2 - TMC2209 EN (active LOW = enabled)
+#define STEP_PIN            0     // D0 - TMC2209 STEP
+#define DIR_PIN             1     // D1 - TMC2209 DIR
+#define EN_PIN              2     // D2 - TMC2209 EN (active LOW = enabled)
+#define TMC_TX_PIN          21    // D3 - TMC2209 UART TX via 1k resistor
 #define I2C_SDA             22    // D4
 #define I2C_SCL             23    // D5
 #define LIMIT_LEFT_PIN      16    // D6 - left limit switch (INPUT_PULLUP, LOW = triggered)
 #define LIMIT_RIGHT_PIN     17    // D7 - right limit switch (INPUT_PULLUP, LOW = triggered)
+#define SPEED_SENSOR_PIN    19    // D8 - speed sensor input
+#define TMC_RX_PIN          20    // D9 - TMC2209 UART RX
+#define POT_PIN             18    // D10 - position feedback potentiometer (ADC)
 
 // ============================================================================
 // I2C ADDRESSES
@@ -120,7 +116,8 @@
 // DEFAULTS
 // ============================================================================
 #define DEFAULT_SENSOR_SPACING    800.0   // mm between sensors
-#define DEFAULT_HYSTERESIS        2.0     // degrees
+#define DEFAULT_HYSTERESIS        2.0     // degrees — dead band to prevent jitter at target
+#define DEFAULT_DEAD_ZONE         5.0     // degrees — lean below this = center, motor disabled
 #define DEFAULT_MAX_LEAN          45.0    // degrees full travel each side
 #define DEFAULT_MIN_DISTANCE      50      // mm
 #define DEFAULT_MAX_DISTANCE      2000    // mm
@@ -165,7 +162,19 @@ struct Config {
 
   // Lean to projector mapping
   float maxLeanAngle;         // Lean angle (deg) that corresponds to full projector travel
-  float hysteresis;           // Dead band to prevent jitter
+  float hysteresis;           // Dead band around target position to prevent jitter
+  float deadZone;             // Lean below this (deg) = center position, motor disabled
+
+  // Position pot feedback
+  bool  usePot;               // true = closed loop via pot, false = open loop step count
+  int   potLeftADC;           // ADC reading at left limit switch (saved during homing)
+  int   potRightADC;          // ADC reading at right limit switch (saved during homing)
+  int   potCenterADC;         // ADC reading at center = (left+right)/2 + offset
+  int   potCenterOffset;      // User-adjustable offset in ADC counts (+/- 200)
+  int   potDeadband;          // ADC counts of deadband around target (prevents hunting)
+
+  // TMC2209 current control via UART
+  int   motorCurrentMA;       // Motor RMS current in mA (50–400)
 
   // Speed sensor
   uint16_t pulsesPerRev;
@@ -189,6 +198,16 @@ Config config = {
   // Lean mapping
   DEFAULT_MAX_LEAN,
   DEFAULT_HYSTERESIS,
+  DEFAULT_DEAD_ZONE,
+  // Pot feedback (disabled until homing run)
+  false,   // usePot
+  0,       // potLeftADC
+  4095,    // potRightADC
+  2047,    // potCenterADC
+  0,       // potCenterOffset
+  30,      // potDeadband (~0.5° at 1:1)
+  // TMC2209 current
+  300,     // motorCurrentMA — validated at 300mA, 15min continuous, ~60-65°C surface
   // Speed sensor
   4, 1.95f
 };
@@ -217,10 +236,13 @@ struct SystemState {
 
   // Stepper / projector
   bool homingComplete;
+  bool stepperActive;         // true when motor is enabled and tracking
   long currentSteps;          // Steps from center (negative = left, positive = right)
   long homingMaxSteps;        // Total steps left-to-right measured during homing
   long targetSteps;           // Requested target position in steps from center
-  float projectorAngle;       // Current projector angle in degrees (derived from steps)
+  float projectorAngle;       // Current projector angle in degrees
+  int  potADC;                // Raw ADC reading from position pot (0-4095)
+  float potAngle;             // Pot-derived projector angle in degrees
 
   // Test mode
   bool testMode;
@@ -245,6 +267,90 @@ Preferences preferences;
 
 unsigned long lastSampleTime    = 0;
 unsigned long lastStepTime      = 0;
+
+// ============================================================================
+// TMC2209 UART CURRENT CONTROL (raw protocol, no TMCStepper library)
+// Wiring: D3/IO21 -1k-> TMC TX pad, D9/IO20 -> TMC TX pad, 10k pullup to 3.3V
+// ============================================================================
+uint8_t tmcCRC(uint8_t* d, uint8_t len) {
+  uint8_t crc = 0;
+  for (uint8_t i = 0; i < len; i++) {
+    uint8_t b = d[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      if ((crc >> 7) ^ (b & 1)) crc = (crc << 1) ^ 0x07;
+      else crc = crc << 1;
+      b >>= 1;
+    }
+  }
+  return crc;
+}
+
+void tmcWriteReg(uint8_t reg, uint32_t val) {
+  uint8_t pkt[7] = {0x05, 0x00, (uint8_t)(reg | 0x80),
+    (uint8_t)(val >> 24), (uint8_t)(val >> 16),
+    (uint8_t)(val >> 8),  (uint8_t)(val)};
+  uint8_t crc = tmcCRC(pkt, 7);
+  for (int i = 0; i < 7; i++) Serial1.write(pkt[i]);
+  Serial1.write(crc);
+  Serial1.flush();
+  delay(2);
+  while (Serial1.available()) Serial1.read(); // drain echo
+}
+
+void tmcSetCurrent(uint16_t mA) {
+  // CS = I_rms * 32 * sqrt(2) * Rsense / V_FS - 1
+  // V_FS = 0.325V, Rsense = 0.11 ohm (adjust if needed)
+  float cs = mA / 1000.0f * 32.0f * 1.41421f * 0.11f / 0.325f - 1.0f;
+  uint8_t irun  = (uint8_t)constrain((int)round(cs), 0, 31);
+  uint8_t ihold = irun / 2;
+  uint32_t regval = ((uint32_t)3 << 16) | ((uint32_t)irun << 8) | ihold;
+  Serial.printf("[TMC] Setting current: %umA  IRUN=%d  IHOLD=%d\n", mA, irun, ihold);
+  // GCONF: all defaults (I_scale_analog=0, pdn_disable=0, mstep_reg_select=0)
+  tmcWriteReg(0x00, 0x00000000);
+  delay(5);
+  tmcWriteReg(0x10, regval);
+}
+
+void initTMCUart() {
+  Serial.printf("[TMC] Initializing UART at 115200, target current %umA\n",
+                config.motorCurrentMA);
+  Serial1.begin(115200, SERIAL_8N1, TMC_RX_PIN, TMC_TX_PIN);
+  delay(50);
+  tmcSetCurrent(config.motorCurrentMA);
+  Serial1.end();
+  // Restore stepper pins
+  pinMode(STEP_PIN, OUTPUT); digitalWrite(STEP_PIN, LOW);
+  pinMode(DIR_PIN,  OUTPUT); digitalWrite(DIR_PIN,  LOW);
+  pinMode(EN_PIN,   OUTPUT); digitalWrite(EN_PIN,   HIGH);
+  Serial.println("[TMC] UART done, stepper pins restored");
+}
+
+// ============================================================================
+// POSITION POTENTIOMETER
+// ============================================================================
+int readPotADC() {
+  // Average 4 samples to reduce noise
+  long sum = 0;
+  for (int i = 0; i < 4; i++) { sum += analogRead(POT_PIN); delay(1); }
+  return (int)(sum / 4);
+}
+
+// Convert pot ADC reading to projector angle in degrees
+// Uses potLeftADC, potRightADC, potCenterADC from config
+float potADCToAngle(int adc) {
+  if (!config.usePot) return 0.0f;
+  int center = config.potCenterADC;
+  float range = (float)(config.potRightADC - config.potLeftADC);
+  if (fabsf(range) < 10) return 0.0f; // not calibrated
+  float maxAngle = config.maxLeanAngle;
+  return (float)(adc - center) / (range / 2.0f) * maxAngle;
+}
+
+void updatePotReading() {
+  state.potADC   = readPotADC();
+  state.potAngle = potADCToAngle(state.potADC);
+  if (config.usePot) state.projectorAngle = state.potAngle;
+}
 
 // ============================================================================
 // SPEED SENSOR (interrupt-based)
@@ -499,10 +605,14 @@ bool homeProjector() {
       stepperDisable();
       return false;
     }
-    // Yield to WiFi/web server every 100 steps
     if (steps % 100 == 0) { server.handleClient(); ArduinoOTA.handle(); }
   }
   Serial.printf("Left limit hit after %ld steps\n", steps);
+
+  // Record pot ADC at left limit
+  delay(50);
+  config.potLeftADC = readPotADC();
+  Serial.printf("  Pot ADC at left limit: %d\n", config.potLeftADC);
 
   // Back off from left limit
   for (int i = 0; i < HOMING_BACKOFF_STEPS; i++) stepMotor(true, HOMING_SPEED_US);
@@ -524,6 +634,11 @@ bool homeProjector() {
   }
   Serial.printf("Right limit hit. Total travel: %ld steps\n", steps);
 
+  // Record pot ADC at right limit
+  delay(50);
+  config.potRightADC = readPotADC();
+  Serial.printf("  Pot ADC at right limit: %d\n", config.potRightADC);
+
   // Back off from right limit
   for (int i = 0; i < HOMING_BACKOFF_STEPS; i++) {
     stepMotor(false, HOMING_SPEED_US);
@@ -543,56 +658,98 @@ bool homeProjector() {
     state.currentSteps++;
   }
 
+  // Calculate and save pot center ADC
+  config.potCenterADC = (config.potLeftADC + config.potRightADC) / 2
+                        + config.potCenterOffset;
+  config.usePot = true;
+  Serial.printf("  Pot center ADC: %d (offset %d)\n",
+                config.potCenterADC, config.potCenterOffset);
+  saveConfig();
+
   // Re-zero: center is now step 0 reference
-  // currentSteps relative to center: 0 = straight ahead
-  state.currentSteps = 0;
+  state.currentSteps  = 0;
   state.homingComplete = true;
   state.projectorAngle = 0.0f;
-  Serial.printf("Homing complete. Max travel: %ld steps (%.1f deg)\n",
+
+  Serial.printf("Homing complete. Travel: %ld steps (%.1f deg)\n",
                 state.homingMaxSteps,
                 (float)state.homingMaxSteps / STEPS_PER_DEGREE);
+  Serial.printf("Pot range: %d (left) to %d (right), center %d\n",
+                config.potLeftADC, config.potRightADC, config.potCenterADC);
   return true;
 }
 
 // Move projector to target angle (degrees, negative = left, positive = right)
-// Called from main loop - moves one step per call for non-blocking operation
+// Called from main loop - moves one step per call for non-blocking operation.
+//
+// Control strategy:
+//   |lean| < deadZone  → target is center (0 steps), disable motor when reached
+//   |lean| >= deadZone → enable motor, track lean angle mapped to projector travel
+//   Motor is only enabled when actively moving toward a target.
+//   Once target is reached the worm gear holds position and motor is disabled.
 void updateProjectorPosition() {
   if (!state.homingComplete) return;
 
   float targetAngle = state.testMode ? state.testAngle : state.leanAngle;
 
-  // Clamp to safe range
+  // Dead zone: lean below threshold snaps target to center
+  if (!state.testMode && fabsf(targetAngle) < config.deadZone) {
+    targetAngle = 0.0f;
+  }
+
+  // Clamp to safe mechanical range
   float maxAngle = (float)state.homingMaxSteps / 2.0f / STEPS_PER_DEGREE;
   targetAngle = constrain(targetAngle, -maxAngle, maxAngle);
 
-  // Apply hysteresis dead band
-  static float lastCommandedAngle = 0.0f;
-  if (fabsf(targetAngle - lastCommandedAngle) < config.hysteresis) {
-    // Within dead band - don't move
-    return;
-  }
-  lastCommandedAngle = targetAngle;
-
+  // Map angle to steps from center
   state.targetSteps = (long)(targetAngle * STEPS_PER_DEGREE);
 }
 
-// Non-blocking single-step toward target, called every loop iteration
+// Non-blocking single-step toward target.
+// In closed-loop mode (usePot=true): uses pot ADC as position feedback.
+// In open-loop mode: uses step counter.
+// Enables motor when movement needed, disables when target reached.
 void stepTowardTarget() {
   if (!state.homingComplete) return;
-  if (state.currentSteps == state.targetSteps) return;
+
+  long error;
+  if (config.usePot) {
+    // Closed loop: compare pot ADC to target ADC
+    // Convert targetSteps to target ADC
+    float targetAngle = (float)state.targetSteps / STEPS_PER_DEGREE;
+    float adcRange    = (float)(config.potRightADC - config.potLeftADC);
+    int   targetADC   = config.potCenterADC + (int)(targetAngle / config.maxLeanAngle
+                        * adcRange / 2.0f);
+    error = targetADC - state.potADC;
+    if (abs(error) <= config.potDeadband) {
+      if (state.stepperActive) { stepperDisable(); state.stepperActive = false; }
+      return;
+    }
+  } else {
+    // Open loop: use step counter
+    error = state.targetSteps - state.currentSteps;
+    if (abs(error) <= 1) {
+      if (state.stepperActive) { stepperDisable(); state.stepperActive = false; }
+      return;
+    }
+  }
+
+  // Need to move — enable motor if not already
+  if (!state.stepperActive) { stepperEnable(); state.stepperActive = true; }
 
   // Safety: don't drive into limits
-  if (leftLimitTriggered()  && state.targetSteps < state.currentSteps) return;
-  if (rightLimitTriggered() && state.targetSteps > state.currentSteps) return;
+  if (leftLimitTriggered()  && error < 0) { stepperDisable(); state.stepperActive = false; return; }
+  if (rightLimitTriggered() && error > 0) { stepperDisable(); state.stepperActive = false; return; }
 
+  // Rate limit
   unsigned long now = micros();
   if (now - lastStepTime < (unsigned long)NORMAL_SPEED_US) return;
   lastStepTime = now;
 
-  bool dir = (state.targetSteps > state.currentSteps);
-  stepMotor(dir, 1); // delayUs=1 since we already throttled above
+  bool dir = (error > 0);
+  stepMotor(dir, 1);
   state.currentSteps += dir ? 1 : -1;
-  state.projectorAngle = (float)state.currentSteps / STEPS_PER_DEGREE;
+  if (!config.usePot) state.projectorAngle = (float)state.currentSteps / STEPS_PER_DEGREE;
 }
 
 
@@ -623,9 +780,17 @@ void loadConfig() {
 
   config.maxLeanAngle  = preferences.getFloat("maxLean",   DEFAULT_MAX_LEAN);
   config.hysteresis    = preferences.getFloat("hysteresis",DEFAULT_HYSTERESIS);
+  config.deadZone      = preferences.getFloat("deadZone",  DEFAULT_DEAD_ZONE);
+  config.usePot        = preferences.getBool("usePot",     false);
+  config.potLeftADC    = preferences.getInt("potLeftADC",  0);
+  config.potRightADC   = preferences.getInt("potRightADC", 4095);
+  config.potCenterADC  = preferences.getInt("potCenterADC",2047);
+  config.potCenterOffset = preferences.getInt("potOffset", 0);
+  config.potDeadband   = preferences.getInt("potDeadband", 30);
+  config.motorCurrentMA = preferences.getInt("motorMA",    200);
   config.useIMU        = preferences.getBool("useIMU",     true);
   config.useDistanceSensors = preferences.getBool("useDist", true);
-  config.imuYawAxis    = preferences.getInt("imuAxis",     2);
+  config.imuYawAxis    = preferences.getInt("imuAxis",     0);  // X confirmed on bench
   config.imuYawInvert  = preferences.getBool("imuInv",     false);
   config.pulsesPerRev  = preferences.getUShort("ppr",      4);
   config.wheelCircumference = preferences.getFloat("wheelC", 1.95f);
@@ -658,6 +823,14 @@ void saveConfig() {
 
   preferences.putFloat("maxLean",     config.maxLeanAngle);
   preferences.putFloat("hysteresis",  config.hysteresis);
+  preferences.putFloat("deadZone",    config.deadZone);
+  preferences.putBool("usePot",       config.usePot);
+  preferences.putInt("potLeftADC",    config.potLeftADC);
+  preferences.putInt("potRightADC",   config.potRightADC);
+  preferences.putInt("potCenterADC",  config.potCenterADC);
+  preferences.putInt("potOffset",     config.potCenterOffset);
+  preferences.putInt("potDeadband",   config.potDeadband);
+  preferences.putInt("motorMA",       config.motorCurrentMA);
   preferences.putBool("useIMU",       config.useIMU);
   preferences.putBool("useDist",      config.useDistanceSensors);
   preferences.putInt("imuAxis",       config.imuYawAxis);
@@ -753,6 +926,7 @@ String htmlHeader(const String& title) {
   h += "<li><a href='/calibrate'>Calibration</a></li>";
   h += "<li><a href='/config'>Config</a></li>";
   h += "<li><a href='/update'>OTA</a></li>";
+  h += "<li><a href='/log'>Log</a></li>";
   h += "<li><a href='/test'>" + String(state.testMode ? "&#9679; Test" : "Test") + "</a></li>";
   h += "</ul></div></nav><div class='wrap'>";
   return h;
@@ -776,6 +950,8 @@ void handleRoot() {
   html += "document.getElementById('rDist').innerText=d.rightDist;";
   html += "document.getElementById('speed').innerText=d.speed.toFixed(1);";
   html += "document.getElementById('homed').innerText=d.homed?'Yes':'No';";
+  html += "document.getElementById('motorState').innerText=d.motorActive?'ACTIVE':'idle';";
+  html += "if(document.getElementById('potADC'))document.getElementById('potADC').innerText=d.potADC;";
   html += "document.getElementById('errs').innerText=d.errors;";
   html += "document.getElementById('uptime').innerText=Math.floor(d.uptime/1000)+'s';";
   html += "var pb=document.getElementById('projBar');";
@@ -801,7 +977,8 @@ void handleRoot() {
   html += "<h2>Projector</h2><div class='grid'>";
   html += "<div class='card'><h3>Projector Angle</h3><div class='val' id='projAngle'>" + String(state.projectorAngle,1) + "</div><div class='unit'>degrees</div></div>";
   html += "<div class='card'><h3>Step Position</h3><div class='val' id='projSteps'>" + String(state.currentSteps) + "</div><div class='unit'>steps from center</div></div>";
-  html += "<div class='card'><h3>Homed</h3><div class='val' id='homed'>" + String(state.homingComplete?"Yes":"No") + "</div></div>";
+  html += "<div class='card'><h3>Motor</h3><div class='val' id='motorState'>" + String(state.stepperActive?"ACTIVE":"idle") + "</div><div class='unit'>dead zone ±" + String(config.deadZone,0) + "°</div></div>";
+  html += "<div class='card'><h3>Pot ADC</h3><div class='val' id='potADC'>" + String(state.potADC) + "</div><div class='unit'>" + String(config.usePot?"closed loop":"open loop") + "</div></div>";
   html += "</div>";
 
   html += "<h2>Sensors</h2><div class='grid'>";
@@ -828,6 +1005,8 @@ void handleAPIStatus() {
   j += "\"rightValid\":"  + String(state.rightValid?"true":"false") + ",";
   j += "\"speed\":"       + String(state.speedMs, 2)        + ",";
   j += "\"homed\":"       + String(state.homingComplete?"true":"false") + ",";
+  j += "\"motorActive\":" + String(state.stepperActive?"true":"false")  + ",";
+  j += "\"potADC\":"      + String(state.potADC)                        + ",";
   j += "\"errors\":"      + String(state.errorCount)        + ",";
   j += "\"uptime\":"      + String(millis())                + "}";
   server.send(200, "application/json", j);
@@ -842,10 +1021,31 @@ void handleCalibrate() {
   html += "<form action='/api/calibrate' method='POST'>";
 
   html += "<h2>Lean Mapping</h2>";
-  html += "<div class='info'>Max lean angle = full projector travel. Hysteresis prevents jitter near center.</div>";
-  html += "<div class='row2'>";
+  html += "<div class='info'>Dead zone: lean below this angle keeps projector centered and motor disabled. Hysteresis prevents hunting once projector reaches target.</div>";
+  html += "<div class='row3'>";
+  html += "<div><label>Dead Zone (°)</label><input type='number' name='deadZone' step='0.5' value='" + String(config.deadZone,1) + "'></div>";
   html += "<div><label>Max Lean Angle (°)</label><input type='number' name='maxLean' step='1' value='" + String(config.maxLeanAngle,0) + "'></div>";
-  html += "<div><label>Hysteresis (°)</label><input type='number' name='hysteresis' step='0.5' value='" + String(config.hysteresis,1) + "'></div>";
+  html += "<div><label>Position Hysteresis (°)</label><input type='number' name='hysteresis' step='0.5' value='" + String(config.hysteresis,1) + "'></div>";
+  html += "</div>";
+
+  html += "<h2>Motor Current</h2>";
+  html += "<div class='info'>RMS current sent to TMC2209 via UART on startup. Applied at next boot. Range 50-400mA. Motor rated 200mA.</div>";
+  html += "<div class='row2'>";
+  html += "<div><label>Motor Current (mA)</label><input type='number' name='motorCurrentMA' step='10' min='50' max='400' value='" + String(config.motorCurrentMA) + "'></div>";
+  html += "<div><label>Pot Deadband (ADC counts)</label><input type='number' name='potDeadband' step='1' min='5' max='200' value='" + String(config.potDeadband) + "'></div>";
+  html += "</div>";
+
+  html += "<h2>Position Pot</h2>";
+  html += "<div class='info'>Pot calibration is set automatically during homing. Use Center Offset to fine-tune the zero position after homing. Positive = shift right, negative = shift left.</div>";
+  html += "<div class='row3'>";
+  html += "<div><label>Pot Enabled</label><input type='text' name='' value='" + String(config.usePot?"YES - Closed loop":"NO - Open loop") + "' readonly style='background:#111'></div>";
+  html += "<div><label>Center Offset (ADC counts)</label><input type='number' name='potCenterOffset' step='1' min='-200' max='200' value='" + String(config.potCenterOffset) + "'></div>";
+  html += "<div><label>Current Pot ADC</label><input type='text' value='" + String(state.potADC) + "' readonly style='background:#111'></div>";
+  html += "</div>";
+  html += "<div class='row3'>";
+  html += "<div><label>Left Limit ADC</label><input type='text' value='" + String(config.potLeftADC) + "' readonly style='background:#111'></div>";
+  html += "<div><label>Center ADC</label><input type='text' value='" + String(config.potCenterADC) + "' readonly style='background:#111'></div>";
+  html += "<div><label>Right Limit ADC</label><input type='text' value='" + String(config.potRightADC) + "' readonly style='background:#111'></div>";
   html += "</div>";
 
   html += "<h2>Sensor Geometry — Left</h2>";
@@ -887,13 +1087,23 @@ void handleCalibrate() {
 
   html += "<button type='submit'>Save Calibration</button>";
   html += "</form>";
+  html += "<br><button onclick=\"if(confirm('Run homing sequence? Motor will move to both limit switches.')){fetch('/api/setzero').then(r=>r.json()).then(d=>alert(d.msg))}\">&#8962; Run Homing &amp; Set Zero</button>";
   html += htmlFooter();
   server.send(200, "text/html", html);
 }
 
 void handleAPICalibrate() {
   if (server.method() != HTTP_POST) { server.send(405); return; }
-  if (server.hasArg("maxLean"))   config.maxLeanAngle        = server.arg("maxLean").toFloat();
+  if (server.hasArg("deadZone"))       config.deadZone            = server.arg("deadZone").toFloat();
+  if (server.hasArg("maxLean"))        config.maxLeanAngle        = server.arg("maxLean").toFloat();
+  if (server.hasArg("hysteresis"))     config.hysteresis          = server.arg("hysteresis").toFloat();
+  if (server.hasArg("motorCurrentMA")) config.motorCurrentMA      = server.arg("motorCurrentMA").toInt();
+  if (server.hasArg("potDeadband"))    config.potDeadband         = server.arg("potDeadband").toInt();
+  if (server.hasArg("potCenterOffset")) {
+    config.potCenterOffset = server.arg("potCenterOffset").toInt();
+    // Recalculate center ADC with new offset
+    config.potCenterADC = (config.potLeftADC + config.potRightADC) / 2 + config.potCenterOffset;
+  }
   if (server.hasArg("hysteresis"))config.hysteresis          = server.arg("hysteresis").toFloat();
   if (server.hasArg("lsH"))       config.leftSensor.heightMm = server.arg("lsH").toFloat();
   if (server.hasArg("lsW"))       config.leftSensor.widthMm  = server.arg("lsW").toFloat();
@@ -1028,6 +1238,17 @@ void handleAPITest() {
   server.send(303);
 }
 
+// Set zero / rehome via limit switches
+void handleAPISetZero() {
+  // Trigger a new homing sequence and save pot calibration
+  state.homingComplete = false;
+  if (homeProjector()) {
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Homing complete, zero set\"}");
+  } else {
+    server.send(200, "application/json", "{\"ok\":false,\"msg\":\"Homing failed\"}");
+  }
+}
+
 void handleAPIRehome() {
   server.send(200, "text/html",
     "<html><body style='background:#1a1a1a;color:#e0e0e0;font-family:-apple-system,sans-serif;"
@@ -1093,6 +1314,112 @@ void handleUpdateComplete() {
 }
 
 // ============================================================================
+// DATALOG PAGE
+// Streams CSV rows to the browser. The page accumulates rows in memory and
+// lets the user download the result as a .csv file.
+// Columns: timestamp_ms, lean_fused, lean_dist, lean_imu, left_dist,
+//          right_dist, speed_ms, projector_angle, left_valid, right_valid
+// ============================================================================
+void handleLog() {
+  String html = htmlHeader("Datalog");
+
+  html += "<div style='display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px;'>";
+  html += "<button id='btnStart' onclick='startLog()'>Start Logging</button>";
+  html += "<button id='btnStop' onclick='stopLog()' class='sec' disabled>Stop</button>";
+  html += "<button onclick='clearLog()' class='sec'>Clear</button>";
+  html += "<button onclick='downloadCSV()'>Download CSV</button>";
+  html += "<span id='rowCount' style='color:#555;font-size:0.85em;'>0 rows</span>";
+  html += "<span id='status' style='color:#555;font-size:0.85em;'></span>";
+  html += "</div>";
+
+  html += "<div style='background:#111;border:1px solid #222;border-radius:4px;padding:12px;margin-bottom:12px;'>";
+  html += "<div style='font-size:0.7em;letter-spacing:1px;text-transform:uppercase;color:#555;margin-bottom:8px;'>Live — last 10 rows</div>";
+  html += "<div style='overflow-x:auto;'>";
+  html += "<table id='preview' style='width:100%;border-collapse:collapse;font-size:0.8em;font-family:monospace;'>";
+  html += "<thead><tr style='color:#555;text-align:right;'>";
+  html += "<th style='padding:4px 8px;text-align:left;'>time(ms)</th>";
+  html += "<th style='padding:4px 8px;'>lean_fused</th>";
+  html += "<th style='padding:4px 8px;'>lean_dist</th>";
+  html += "<th style='padding:4px 8px;'>lean_imu</th>";
+  html += "<th style='padding:4px 8px;'>l_dist</th>";
+  html += "<th style='padding:4px 8px;'>r_dist</th>";
+  html += "<th style='padding:4px 8px;'>speed</th>";
+  html += "<th style='padding:4px 8px;'>proj_ang</th>";
+  html += "</tr></thead>";
+  html += "<tbody id='previewBody'></tbody></table></div></div>";
+
+  html += "<script>";
+  html += "var rows=[];var logging=false;var timer=null;";
+  html += "function startLog(){";
+  html += "logging=true;";
+  html += "document.getElementById('btnStart').disabled=true;";
+  html += "document.getElementById('btnStop').disabled=false;";
+  html += "document.getElementById('status').innerText='Logging...';";
+  html += "timer=setInterval(fetchRow,200);";  // 5 Hz
+  html += "}";
+  html += "function stopLog(){";
+  html += "logging=false;clearInterval(timer);";
+  html += "document.getElementById('btnStart').disabled=false;";
+  html += "document.getElementById('btnStop').disabled=true;";
+  html += "document.getElementById('status').innerText='Stopped ('+rows.length+' rows)';";
+  html += "}";
+  html += "function clearLog(){";
+  html += "rows=[];";
+  html += "document.getElementById('previewBody').innerHTML='';";
+  html += "document.getElementById('rowCount').innerText='0 rows';";
+  html += "}";
+  html += "function fetchRow(){";
+  html += "fetch('/api/logrow').then(r=>r.json()).then(d=>{";
+  html += "var row=[d.t,d.lf.toFixed(2),d.ld.toFixed(2),d.li.toFixed(2),";
+  html += "d.ldist,d.rdist,d.spd.toFixed(2),d.pa.toFixed(2),d.lv?1:0,d.rv?1:0];";
+  html += "rows.push(row);";
+  html += "document.getElementById('rowCount').innerText=rows.length+' rows';";
+  html += "updatePreview(row);";
+  html += "}).catch(()=>{});";
+  html += "}";
+  html += "function updatePreview(row){";
+  html += "var tb=document.getElementById('previewBody');";
+  html += "var tr=document.createElement('tr');";
+  html += "var cols=[0,1,2,3,4,5,6,7];";  // first 8 cols in preview
+  html += "cols.forEach(function(i){";
+  html += "var td=document.createElement('td');";
+  html += "td.style.cssText='padding:3px 8px;text-align:'+(i===0?'left':'right')+';color:#aaa;border-top:1px solid #1a1a1a;';";
+  html += "td.innerText=row[i];tr.appendChild(td);});";
+  html += "tb.appendChild(tr);";
+  html += "while(tb.rows.length>10)tb.deleteRow(0);";
+  html += "}";
+  html += "function downloadCSV(){";
+  html += "if(rows.length===0){alert('No data logged yet');return;}";
+  html += "var hdr='timestamp_ms,lean_fused,lean_dist,lean_imu,left_dist,right_dist,speed_ms,projector_angle,left_valid,right_valid\\n';";
+  html += "var csv=hdr+rows.map(r=>r.join(',')).join('\\n');";
+  html += "var a=document.createElement('a');";
+  html += "a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);";
+  html += "a.download='lean_log_'+Date.now()+'.csv';";
+  html += "document.body.appendChild(a);a.click();document.body.removeChild(a);";
+  html += "}";
+  html += "</script>";
+
+  html += htmlFooter();
+  server.send(200, "text/html", html);
+}
+
+// Single JSON row for the logger — fetched at 5 Hz by the log page
+void handleAPILogRow() {
+  String j = "{";
+  j += "\"t\":"     + String(millis())               + ",";
+  j += "\"lf\":"    + String(state.leanAngle, 2)     + ",";
+  j += "\"ld\":"    + String(state.leanAngleDist, 2) + ",";
+  j += "\"li\":"    + String(state.leanAngleIMU, 2)  + ",";
+  j += "\"ldist\":" + String(state.leftDistance)      + ",";
+  j += "\"rdist\":" + String(state.rightDistance)     + ",";
+  j += "\"spd\":"   + String(state.speedMs, 2)       + ",";
+  j += "\"pa\":"    + String(state.projectorAngle, 2) + ",";
+  j += "\"lv\":"    + String(state.leftValid?"true":"false")  + ",";
+  j += "\"rv\":"    + String(state.rightValid?"true":"false") + "}";
+  server.send(200, "application/json", j);
+}
+
+// ============================================================================
 // WEB SERVER SETUP
 // ============================================================================
 void setupWebServer() {
@@ -1102,12 +1429,15 @@ void setupWebServer() {
   server.on("/update",  HTTP_GET, handleUpdate);
   server.on("/updateUpload", HTTP_POST, handleUpdateComplete, handleUpdateUpload);
   server.on("/test",          handleTest);
+  server.on("/log",           handleLog);
   server.on("/api/status",    handleAPIStatus);
   server.on("/api/calibrate", handleAPICalibrate);
   server.on("/api/config",    handleAPIConfig);
   server.on("/api/reset",     handleAPIReset);
   server.on("/api/test",      handleAPITest);
   server.on("/api/rehome",    handleAPIRehome);
+  server.on("/api/setzero",   handleAPISetZero);
+  server.on("/api/logrow",    handleAPILogRow);
   server.begin();
   Serial.println("Web server started");
 }
@@ -1144,13 +1474,17 @@ void setup() {
   pinMode(STEP_PIN, OUTPUT);
   pinMode(DIR_PIN,  OUTPUT);
   pinMode(EN_PIN,   OUTPUT);
-  stepperDisable();   // Start disabled until homing
+  stepperDisable();
   digitalWrite(STEP_PIN, LOW);
   digitalWrite(DIR_PIN,  LOW);
 
   // Limit switch pins (active LOW, internal pull-up)
   pinMode(LIMIT_LEFT_PIN,  INPUT_PULLUP);
   pinMode(LIMIT_RIGHT_PIN, INPUT_PULLUP);
+
+  // Position pot ADC pin
+  pinMode(POT_PIN, INPUT);
+  analogReadResolution(12);  // 0-4095
 
   // Set default device name with MAC suffix
   {
@@ -1161,6 +1495,9 @@ void setup() {
   }
 
   loadConfig();
+
+  // TMC2209 UART current control
+  initTMCUart();
 
   // I2C
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -1189,12 +1526,25 @@ void setup() {
   setupOTA();
 
   Serial.printf("Access: http://%s.local  or  http://192.168.5.1\n", config.deviceName);
-  Serial.println("Starting homing sequence...");
 
-  // Run homing - this blocks but yields to web server every 100 steps
-  if (!homeProjector()) {
-    Serial.println("WARNING: Homing failed - stepper control disabled");
-    Serial.println("Check limit switches and wiring, then use /api/rehome to retry");
+  // If pot is calibrated from a previous homing, skip homing and use pot for position
+  if (config.usePot && config.potLeftADC != config.potRightADC) {
+    Serial.println("Pot calibration found — skipping homing, using pot for position.");
+    Serial.printf("  Pot range: %d (left) to %d (right), center %d\n",
+                  config.potLeftADC, config.potRightADC, config.potCenterADC);
+    // Read current pot position to determine where we are
+    updatePotReading();
+    state.currentSteps  = (long)(state.potAngle * STEPS_PER_DEGREE);
+    state.homingMaxSteps = (long)(config.maxLeanAngle * 2.0f * STEPS_PER_DEGREE);
+    state.homingComplete = true;
+    state.projectorAngle = state.potAngle;
+    Serial.printf("  Current position: %.1f° (ADC %d)\n", state.potAngle, state.potADC);
+  } else {
+    Serial.println("Starting homing sequence...");
+    if (!homeProjector()) {
+      Serial.println("WARNING: Homing failed - stepper control disabled");
+      Serial.println("Check limit switches and wiring, then use /api/rehome to retry");
+    }
   }
 }
 
@@ -1229,6 +1579,7 @@ void loop() {
 
   // Compute target stepper position and step toward it
   if (state.homingComplete) {
+    updatePotReading();  // always read pot — used for closed loop and dashboard
     updateProjectorPosition();
     stepTowardTarget();
   }
